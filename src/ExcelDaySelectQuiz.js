@@ -465,6 +465,23 @@ export default function ExcelDaySelectQuiz(){
               )}
             </div>
           )}
+
+          <div style={{ marginTop: 12, display: "flex", gap: 8, flexWrap: "wrap" }}>
+            <button
+              onClick={check}
+              disabled={revealed}
+              style={primaryBtn}
+            >
+              제출
+            </button>
+            <button
+              onClick={next}
+              disabled={!revealed}
+              style={secondaryBtn}
+            >
+              다음
+            </button>
+          </div>
         </div>
       )}
 
@@ -551,3 +568,24 @@ const inputStyle = {
 };
 const th = { padding:"10px", borderBottom:"1px solid #eee", textAlign:"left" };
 const td = { padding:"10px", borderBottom:"1px solid #f3f3f3", verticalAlign:"top" };
+
+const primaryBtn = {
+  padding: "10px 14px",
+  borderRadius: 10,
+  border: "1px solid #ccc",
+  background: "#111",
+  color: "#fff",
+  fontWeight: 600,
+  cursor: "pointer",
+  opacity: 1,
+};
+const secondaryBtn = {
+  padding: "10px 14px",
+  borderRadius: 10,
+  border: "1px solid #ccc",
+  background: "#f5f5f5",
+  color: "#111",
+  fontWeight: 600,
+  cursor: "pointer",
+};
+

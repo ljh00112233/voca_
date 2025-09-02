@@ -1,5 +1,6 @@
 import React, { useMemo, useState, useEffect, useRef } from "react";
 import * as XLSX from "xlsx";
+import { saveAs } from "file-saver";
 
 // ===== utils =====
 const split = (s = "") => s.split(/[\/,;|]/g).map(v => v.trim()).filter(Boolean);
@@ -14,6 +15,33 @@ const joinPOS = (r) => {
   return parts.join(" · ");
 };
 
+// 뜻 문자열에서 (명)/(동)/(형) 패턴을 최대한 파싱 (가져온 오답 엑셀에 품사 정보가 합쳐져 있을 때)
+function parseMeaningToPOS(meaningText = "") {
+  const noun = [];
+  const verb = [];
+  const adj  = [];
+  const txt = meaningText.replace(/\s+/g, " ").trim();
+
+  // (명) ..., (동) ..., (형) ... 패턴
+  const re = /\((명|동|형)\)\s*([^()·]+)/g;
+  let m;
+  let matchedAny = false;
+  while ((m = re.exec(txt))) {
+    matchedAny = true;
+    const label = m[1];
+    const body  = m[2] || "";
+    const items = split(body);
+    if (label === "명") noun.push(...items);
+    if (label === "동") verb.push(...items);
+    if (label === "형") adj .push(...items);
+  }
+  if (!matchedAny && txt) {
+    // 품사 구분이 없으면 명사 칸으로 몰아 넣기(최소 동작 보장)
+    noun.push(...split(txt));
+  }
+  return { noun, verb, adj };
+}
+
 // ===== main component =====
 export default function ExcelDaySelectQuiz(){
   // 데이터/선택
@@ -27,7 +55,7 @@ export default function ExcelDaySelectQuiz(){
   const [idx,setIdx] = useState(0);
   const [revealed,setRevealed] = useState(false);
   const [score,setScore] = useState(0);
-  const [finished, setFinished] = useState(false); // ✅ 라운드 완료 상태
+  const [finished, setFinished] = useState(false);
 
   // 입력값
   const [inputsPOS,setInputsPOS] = useState({noun:"",verb:"",adj:""}); // en2ko용
@@ -41,7 +69,10 @@ export default function ExcelDaySelectQuiz(){
   const [searchTerm, setSearchTerm] = useState("");
   const [posFilter, setPosFilter] = useState({ noun:false, verb:false, adj:false });
 
-  const cur = questions[idx];
+  // 오답 노트 (localStorage)
+  const LS_KEY = "voca_wrong_bank_v1";
+  const [wrongBank, setWrongBank] = useState([]); // [{id, word, dayKey, meaningText, addedAt, seen, wrong}]
+  const [showWrongBank, setShowWrongBank] = useState(false);
 
   // 포커스 관리용 ref들
   const containerRef = useRef(null);
@@ -49,6 +80,9 @@ export default function ExcelDaySelectQuiz(){
   const verbRef = useRef(null);
   const adjRef  = useRef(null);
   const enRef   = useRef(null);
+
+  // 오답 엑셀 import용 input ref
+  const wrongImportRef = useRef(null);
 
   // ===== 엑셀 업로드 =====
   const onFile = async (e)=>{
@@ -121,23 +155,195 @@ export default function ExcelDaySelectQuiz(){
     requestAnimationFrame(() => focusFirstInput(false));
   };
 
-  // 오답만 다시 풀기(완료 화면에서 노출)
-  const retryWrong = ()=>{
-    const wrong = history.filter(h => !h.correct);
-    if (wrong.length === 0) {
-      alert("오답이 없습니다!");
-      return;
-    }
-    const qs = wrong.map(h => ({ ...h.rec }));
+  // ===== 오답 노트 (localStorage) =====
+  const loadWrongBank = () => {
+    try {
+      const raw = localStorage.getItem(LS_KEY);
+      if (!raw) return [];
+      const arr = JSON.parse(raw);
+      return Array.isArray(arr) ? arr : [];
+    } catch { return []; }
+  };
+  const persistWrongBank = (updater) => {
+    // updater는 배열 또는 prev=>new 형태
+    setWrongBank(prev => {
+      const next = typeof updater === "function" ? updater(prev) : updater;
+      try { localStorage.setItem(LS_KEY, JSON.stringify(next)); } catch {}
+      return next;
+    });
+  };
+  useEffect(() => {
+    const boot = loadWrongBank();
+    setWrongBank(boot);
+  }, []);
+
+  const wrongId = (rec) => `${rec.dayKey}__${String(rec.word || "").toLowerCase()}`;
+  const saveWrong = (rec) => {
+    const id = wrongId(rec);
+    const now = Date.now();
+    persistWrongBank(prev => {
+      const cur = Array.isArray(prev) ? [...prev] : [];
+      const idx = cur.findIndex(x => x.id === id);
+      const base = {
+        id,
+        word: rec.word,
+        dayKey: rec.dayKey,
+        meaningText: joinPOS(rec),
+        addedAt: now,
+        seen: 0,
+        wrong: 1,
+      };
+      if (idx === -1) cur.push(base);
+      else cur[idx] = { ...cur[idx], meaningText: base.meaningText, wrong: (cur[idx].wrong||0) + 1 };
+      return cur;
+    });
+  };
+  const removeWrong = (id) => persistWrongBank(prev => prev.filter(x => x.id !== id));
+  const clearWrongBank = () => {
+    if (!window.confirm("오답 노트를 모두 비울까요?")) return;
+    persistWrongBank([]);
+  };
+
+  const startQuizFromWrongBank = () => {
+    if (!wrongBank.length) { alert("오답 노트가 비어 있습니다."); return; }
+    const qs = wrongBank.map(x => {
+      const found = rows.find(r => r.word === x.word && String(r.dayKey) === String(x.dayKey));
+      if (found) return { ...found };
+      // rows에 없으면 meaningText를 분해해서 최대한 복원
+      const { noun, verb, adj } = parseMeaningToPOS(x.meaningText);
+      return { word: x.word, dayKey: x.dayKey, noun, verb, adj };
+    });
     const shuffled = [...qs].sort(()=>Math.random()-0.5);
     setQuestions(shuffled);
     setIdx(0); setScore(0); setRevealed(false); setFinished(false);
     setInputsPOS({noun:"",verb:"",adj:""}); setInputEN("");
-    setHistory([]); // 새 라운드를 위해 비움(원하면 유지하도록 바꿀 수 있음)
+    setHistory([]);
     requestAnimationFrame(() => focusFirstInput(false));
   };
 
-  // 현재 문제 품사
+  // ===== 오답: 엑셀 내보내기 / 불러오기 =====
+// 맨 위에 이미 있음:
+// import * as XLSX from "xlsx";
+// import { saveAs } from "file-saver";
+
+const exportWrongBankToExcel = () => {
+    if (!wrongBank.length) {
+      alert("저장할 오답이 없습니다.");
+      return;
+    }
+
+    // 1) 한국시간(KST) 기준 오늘 날짜 문자열 만들기 -> YYYYMMDD
+    const parts = new Intl.DateTimeFormat("ko-KR", {
+      timeZone: "Asia/Seoul",
+      year: "numeric",
+      month: "2-digit",
+      day: "2-digit",
+    }).formatToParts(new Date());
+    const yyyy = parts.find(p => p.type === "year")?.value ?? "0000";
+    const mm   = parts.find(p => p.type === "month")?.value ?? "00";
+    const dd   = parts.find(p => p.type === "day")?.value ?? "00";
+    const todayStr = `${yyyy}${mm}${dd}`; // 예: 20250902
+
+    // 2) 엑셀에 넣을 데이터 가공
+    const data = wrongBank.map((w, i) => ({
+      번호: i + 1,
+      날짜: w.dayKey,
+      단어: w.word,
+      뜻: w.meaningText,
+      "본 횟수": w.seen || 0,
+      "오답 수": w.wrong || 1,
+      추가일시: w.addedAt ? new Date(w.addedAt).toLocaleString() : "",
+    }));
+
+    // 3) 워크시트/워크북 생성 및 저장
+    const ws = XLSX.utils.json_to_sheet(data);
+    const wb = XLSX.utils.book_new();
+    XLSX.utils.book_append_sheet(wb, ws, "오답노트");
+    const wbout = XLSX.write(wb, { type: "array", bookType: "xlsx" });
+
+    // ✅ 파일명에 오늘 날짜 포함
+    saveAs(new Blob([wbout], { type: "application/octet-stream" }), `오답노트_${todayStr}.xlsx`);
+  };
+
+
+  // 엑셀에서 오답 불러와서: 1) 오답 노트로 저장 + 2) 바로 오답 라운드 시작
+  const importWrongBankFromExcel = async (e) => {
+    const f = e.target.files?.[0];
+    if (!f) return;
+    try {
+      const buf = await f.arrayBuffer();
+      const wb = XLSX.read(buf, { type:"array" });
+      const ws = wb.Sheets[wb.SheetNames[0]];
+      const json = XLSX.utils.sheet_to_json(ws, { defval:"" });
+
+      // 컬럼: 날짜/단어/뜻 (번호/본 횟수/오답 수/추가일시 있으면 무시해도 ok)
+      const imported = [];
+      for (const row of json) {
+        // 헤더 다양성 대응
+        const norm = {};
+        for (const k of Object.keys(row)) norm[k.trim().toLowerCase()] = row[k];
+
+        const dayKey = formatDayKey(norm["날짜"] ?? norm["day"] ?? norm["일차"] ?? "");
+        const word   = (norm["단어"] ?? norm["word"] ?? "").toString().trim();
+        const meaningText = (norm["뜻"] ?? norm["의미"] ?? norm["meaning"] ?? "").toString().trim();
+
+        if (!word) continue; // 단어는 필수
+        imported.push({ dayKey: dayKey || "-", word, meaningText });
+      }
+
+      if (!imported.length) {
+        alert("가져올 오답이 없습니다. (엑셀에 날짜/단어/뜻 컬럼 확인)");
+        // input 값 초기화
+        e.target.value = "";
+        return;
+      }
+
+      // 1) 오답 노트에 병합 저장
+      persistWrongBank(prev => {
+        const cur = Array.isArray(prev) ? [...prev] : [];
+        const now = Date.now();
+        for (const it of imported) {
+          const id = `${it.dayKey}__${it.word.toLowerCase()}`;
+          const idx = cur.findIndex(x => x.id === id);
+          const base = {
+            id,
+            word: it.word,
+            dayKey: it.dayKey,
+            meaningText: it.meaningText,
+            addedAt: now,
+            seen: 0,
+            wrong: 1,
+          };
+          if (idx === -1) cur.push(base);
+          else cur[idx] = { ...cur[idx], meaningText: base.meaningText, wrong: (cur[idx].wrong||0) + 1 };
+        }
+        return cur;
+      });
+
+      // 2) 즉시 오답 라운드 시작
+      const qs = imported.map(x => {
+        const found = rows.find(r => r.word === x.word && String(r.dayKey) === String(x.dayKey));
+        if (found) return { ...found };
+        const { noun, verb, adj } = parseMeaningToPOS(x.meaningText);
+        return { word: x.word, dayKey: x.dayKey, noun, verb, adj };
+      });
+      const shuffled = [...qs].sort(()=>Math.random()-0.5);
+      setQuestions(shuffled);
+      setIdx(0); setScore(0); setRevealed(false); setFinished(false);
+      setInputsPOS({noun:"",verb:"",adj:""}); setInputEN("");
+      setHistory([]);
+      requestAnimationFrame(() => focusFirstInput(false));
+    } catch (err) {
+      console.error(err);
+      alert("오답 엑셀을 불러오는 중 오류가 발생했습니다.");
+    } finally {
+      // 같은 파일 다시 선택할 수 있도록 초기화
+      e.target.value = "";
+    }
+  };
+
+  // ===== 현재 문제 품사 =====
+  const cur = questions[idx];
   const presentPOS = useMemo(()=>{
     if(!cur) return [];
     const arr=[]; if(cur.noun?.length) arr.push("noun");
@@ -185,17 +391,20 @@ export default function ExcelDaySelectQuiz(){
         rec: { ...cur }
       }
     ]));
+
+    // ✅ 오답을 오답노트에 저장
+    if (!ok) saveWrong(cur);
+    // (원하면 정답이면 오답노트에서 제거: if (ok) removeWrong(wrongId(cur)); )
   };
 
   // 다음
   const next = ()=>{
     if(idx+1 >= questions.length){
-      // ✅ 완료 처리: 문제 카드 숨기고 완료 화면(풀이 기록 + 버튼만)
+      // 완료 화면 전환
       setFinished(true);
-      setQuestions([]); // 카드 감추기
+      setQuestions([]); // 카드 숨기기
       setIdx(0);
       setRevealed(false);
-      // score는 기록으로 추후 확인 가능
       return;
     }
     setIdx(idx+1); setRevealed(false);
@@ -215,11 +424,10 @@ export default function ExcelDaySelectQuiz(){
     }
   };
 
-  // 전역 Enter(제출/다음)
+  // 전역 Enter(제출/다음) - 완료 화면에선 동작 X
   useEffect(()=>{
     const handler = (e)=>{
       if(e.key !== "Enter") return;
-      // 완료 화면에서는 엔터 동작 안 함(원하면 오답만 다시 풀기 실행 등으로 커스텀 가능)
       if (finished) return;
       e.preventDefault();
       if(questions.length === 0) return;
@@ -466,26 +674,15 @@ export default function ExcelDaySelectQuiz(){
             </div>
           )}
 
+          {/* 모바일 편의: 제출/다음 버튼 */}
           <div style={{ marginTop: 12, display: "flex", gap: 8, flexWrap: "wrap" }}>
-            <button
-              onClick={check}
-              disabled={revealed}
-              style={primaryBtn}
-            >
-              제출
-            </button>
-            <button
-              onClick={next}
-              disabled={!revealed}
-              style={secondaryBtn}
-            >
-              다음
-            </button>
+            <button onClick={check} disabled={revealed} style={primaryBtn}>제출</button>
+            <button onClick={next} disabled={!revealed} style={secondaryBtn}>다음</button>
           </div>
         </div>
       )}
 
-      {/* 풀이 기록 (진행 중에도 보이고, 완료 후에는 버튼이 여기서 노출) */}
+      {/* 풀이 기록 */}
       {history.length > 0 && (
         <div style={{ marginTop:16 }}>
           <div style={{ display:"flex", justifyContent:"space-between", alignItems:"center", marginBottom:8, gap:8, flexWrap:"wrap" }}>
@@ -493,21 +690,11 @@ export default function ExcelDaySelectQuiz(){
               풀이 기록{finished ? " (라운드 완료)" : ""}
             </h3>
 
-            {/* ✅ 완료 후에만 버튼 노출 */}
+            {/* 완료 후에만 버튼 노출 */}
             {finished && (
-              <div style={{ display:"flex", gap:8 }}>
-                <button
-                  onClick={retryWrong}
-                  style={{ padding:"6px 12px", borderRadius:8, border:"1px solid #ccc" }}
-                >
-                  오답만 다시 풀기
-                </button>
-                <button
-                  onClick={()=>resetAll(false)}
-                  style={{ padding:"6px 12px", borderRadius:8, border:"1px solid #ccc" }}
-                >
-                  다시 풀기(초기화)
-                </button>
+              <div style={{ display:"flex", gap:8, flexWrap:"wrap" }}>
+                <button onClick={startQuizFromWrongBank} style={primaryBtn}>오답 노트로 다시 풀기</button>
+                <button onClick={()=>resetAll(false)} style={secondaryBtn}>다시 풀기(초기화)</button>
               </div>
             )}
           </div>
@@ -538,26 +725,75 @@ export default function ExcelDaySelectQuiz(){
               </tbody>
             </table>
           </div>
-
-          {/* ✅ 완료 후에만 하단 버튼 노출 */}
-          {finished && (
-            <div style={{ marginTop:8, textAlign:"right" }}>
-              <button
-                onClick={retryWrong}
-                style={{ marginRight:8, padding:"6px 12px", borderRadius:8, border:"1px solid #ccc" }}
-              >
-                오답만 다시 풀기
-              </button>
-              <button
-                onClick={()=>resetAll(false)}
-                style={{ padding:"6px 12px", borderRadius:8, border:"1px solid #ccc" }}
-              >
-                다시 풀기(초기화)
-              </button>
-            </div>
-          )}
         </div>
       )}
+
+      {/* 오답 노트 */}
+      <div style={{ marginTop: 24 }}>
+        <div style={{ display:"flex", justifyContent:"space-between", alignItems:"center", gap:8, flexWrap:"wrap" }}>
+          <h3 style={{ margin:0 }}>오답 노트 <span style={{ opacity:0.6, fontWeight:400 }}>({wrongBank.length}개)</span></h3>
+          <div style={{ display:"flex", gap:8, flexWrap:"wrap" }}>
+            <button onClick={() => setShowWrongBank(s=>!s)} style={ghostBtn}>
+              {showWrongBank ? "오답 노트 닫기" : "오답 노트 보기"}
+            </button>
+            <button onClick={startQuizFromWrongBank} style={primaryBtn}>오답 노트로 다시 풀기</button>
+            <button onClick={exportWrongBankToExcel} style={secondaryBtn}>오답 엑셀로 저장</button>
+
+            {/* 엑셀 불러오기: 숨은 input 트리거 */}
+            <input
+              ref={wrongImportRef}
+              type="file"
+              accept=".xlsx,.xls"
+              style={{ display:"none" }}
+              onChange={importWrongBankFromExcel}
+            />
+            <button
+              onClick={()=> wrongImportRef.current?.click()}
+              style={secondaryBtn}
+            >
+              오답 엑셀 불러와서 풀기
+            </button>
+
+            <button onClick={clearWrongBank} style={secondaryBtn}>오답 노트 비우기</button>
+          </div>
+        </div>
+
+        {showWrongBank && (
+          <div style={{ marginTop:8, border:"1px solid #eee", borderRadius:8, overflow:"hidden" }}>
+            <table style={{ width:"100%", borderCollapse:"collapse", fontSize:14 }}>
+              <thead>
+                <tr style={{ background:"#fafafa" }}>
+                  <th style={th}>날짜</th>
+                  <th style={th}>단어</th>
+                  <th style={th}>뜻</th>
+                  <th style={th}>본 횟수</th>
+                  <th style={th}>오답 수</th>
+                  <th style={th}>관리</th>
+                </tr>
+              </thead>
+              <tbody>
+                {wrongBank.map((w)=>(
+                  <tr key={w.id}>
+                    <td style={td}>{w.dayKey}</td>
+                    <td style={td}>{w.word}</td>
+                    <td style={td}>{w.meaningText}</td>
+                    <td style={td}>{w.seen || 0}</td>
+                    <td style={td}>{w.wrong || 1}</td>
+                    <td style={td}>
+                      <button onClick={()=>removeWrong(w.id)} style={{ ...secondaryBtn, padding:"6px 10px" }}>
+                        삭제
+                      </button>
+                    </td>
+                  </tr>
+                ))}
+                {wrongBank.length === 0 && (
+                  <tr><td colSpan={6} style={{ ...td, textAlign:"center", opacity:0.7 }}>오답 노트가 비어 있습니다.</td></tr>
+                )}
+              </tbody>
+            </table>
+          </div>
+        )}
+      </div>
     </div>
   );
 }
@@ -577,7 +813,6 @@ const primaryBtn = {
   color: "#fff",
   fontWeight: 600,
   cursor: "pointer",
-  opacity: 1,
 };
 const secondaryBtn = {
   padding: "10px 14px",
@@ -588,4 +823,11 @@ const secondaryBtn = {
   fontWeight: 600,
   cursor: "pointer",
 };
-
+const ghostBtn = {
+  padding: "8px 12px",
+  borderRadius: 10,
+  border: "1px solid #ddd",
+  background: "transparent",
+  color: "#111",
+  cursor: "pointer",
+};
